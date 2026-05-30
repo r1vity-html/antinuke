@@ -16,6 +16,12 @@ import mysql.connector
 from mysql.connector import Error
 from collections import defaultdict
 import datetime
+
+# 🧧 紅包功能全域開關
+redpacket_enabled = True 
+
+# 📢 搶紅包中獎廣播開關：True 代表全頻道廣播，False 代表低調默默拿錢（不發中獎訊息）
+redpacket_broadcast_enabled = True
 user_tasks = {}
 TASK_POOL = {
     1: {"desc": "🌅 一日之計在於晨：在群裡打字說 `早安`、`午安` 或 `晚安` 補給能量", "needed": 1, "reward": 100},
@@ -148,7 +154,7 @@ GUILDS_FILE = "guilds_data.json"
 
 SNAPSHOT_DIR = Path("snapshots")
 SNAPSHOT_TTL_SECONDS = 72 * 3600  # 72 hours
-VERSION = "v1.0.8"  # 版本號
+VERSION = "v1.1.0"  # 版本號
 
 SNAPSHOT_DIR.mkdir(exist_ok=True)
 
@@ -271,34 +277,147 @@ def update_user_coins(user_id: int, amount: int):
     except Exception as e:
         print(f"[金幣系統] 更新餘額失敗: {e}")
 
-def get_user_status(user_id: int) -> dict:
+def get_user_status(user_id: int):
     """從資料庫獲取使用者當前的任務與打工狀態 (防呆自動開戶)"""
     try:
         conn = get_db_connection()
-        cursor = conn.cursor(pymysql.cursors.DictCursor) # 讓讀出來的資料直接變 Dictionary
-        # 確保使用者一定存在
+        if conn is None:
+            return {"task_id": None, "task_progress": 0, "task_completed": False, "task_time": 0.0, "work_cooldown": 0.0}
+            
+        # 💡 官方 mysql.connector 的 DictCursor 寫法是 dictionary=True
+        cursor = conn.cursor(dictionary=True)
+        
+        # 1. 確保 user_coins 表裡一定有這個使用者
+        # 💡 官方套件的預留字元是 %s
         cursor.execute("INSERT IGNORE INTO user_coins (user_id, coins) VALUES (%s, 100)", (user_id,))
-        cursor.execute("SELECT task_id, task_progress, task_completed, task_time, work_cooldown FROM user_coins WHERE user_id = %s", (user_id,))
+        conn.commit() # 確保開戶寫入
+        
+        # 2. 撈出打工與任務欄位
+        cursor.execute(
+            "SELECT task_id, task_progress, task_completed, task_time, work_cooldown "
+            "FROM user_coins WHERE user_id = %s", (user_id,)
+        )
         result = cursor.fetchone()
+        
         cursor.close()
         conn.close()
-        return result
+        
+        if result:
+            return result
+        return {"task_id": None, "task_progress": 0, "task_completed": False, "task_time": 0.0, "work_cooldown": 0.0}
     except Exception as e:
         print(f"[系統] 讀取狀態失敗: {e}")
-        return {"task_id": None, "task_progress": 0, "task_completed": False, "task_time": 0, "work_cooldown": 0}
+        return {"task_id": None, "task_progress": 0, "task_completed": False, "task_time": 0.0, "work_cooldown": 0.0}
+    
+def divide_red_packet(remaining_amount: int, remaining_pieces: int) -> int:
+    if remaining_pieces == 1:
+        return remaining_amount
+    # 最多能抽到目前平均值的 2 倍
+    max_amount = (remaining_amount // remaining_pieces) * 2
+    if max_amount <= 1:
+        max_amount = 2
+    return random.randint(1, max_amount)
+
+# ─── 🟥 搶紅包的按鈕界面 ───
+class RedPacketView(discord.ui.View):
+    def __init__(self, packet_id: int):
+        super().__init__(timeout=None)  # 按鈕長期有效
+        self.packet_id = packet_id
+
+    @discord.ui.button(label="🧧 搶紅包！", style=discord.ButtonStyle.danger, custom_id="grab_red_packet_btn")
+    async def grab_packet(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 1. 檢查系統是否暫停
+        global redpacket_enabled, redpacket_broadcast_enabled
+        if not redpacket_enabled:
+            await interaction.response.send_message("⚠️ 紅包系統維護中，暫停領取！", ephemeral=True)
+            return
+
+        user_id = interaction.user.id
+        conn = get_db_connection()
+        if conn is None:
+            await interaction.response.send_message("❌ 資料庫連線失敗，請稍後再試！", ephemeral=True)
+            return
+            
+        cursor = conn.cursor(dictionary=True)
+        
+        try:
+            # 核心安全鎖
+            cursor.execute("SELECT * FROM red_packets WHERE id = %s FOR UPDATE", (self.packet_id,))
+            packet = cursor.fetchone()
+            
+            if not packet:
+                await interaction.response.send_message("❌ 這個紅包已經在江湖中消失了！", ephemeral=True)
+                return
+                
+            # 檢查剩餘份數
+            if packet["remaining_pieces"] <= 0:
+                await interaction.response.send_message("😭 手速太慢啦！紅包已經被搶光了！", ephemeral=True)
+                button.disabled = True
+                button.label = "🧧 已被搶光"
+                await interaction.message.edit(view=self)
+                return
+                
+            # 檢查是否搶過
+            claimed = json.loads(packet["claimed_list"]) if packet["claimed_list"] else {}
+            if str(user_id) in claimed:
+                await interaction.response.send_message(f"❌ 你已經搶過這個紅包囉！你拿到了 **{claimed[str(user_id)]}** 金幣。", ephemeral=True)
+                return
+                
+            # 計算金額並更新
+            grabbed_amount = divide_red_packet(packet["remaining_amount"], packet["remaining_pieces"])
+            claimed[str(user_id)] = grabbed_amount
+            new_remaining_amount = packet["remaining_amount"] - grabbed_amount
+            new_remaining_pieces = packet["remaining_pieces"] - 1
+            
+            cursor.execute(
+                "UPDATE red_packets SET remaining_amount = %s, remaining_pieces = %s, claimed_list = %s WHERE id = %s",
+                (new_remaining_amount, new_remaining_pieces, json.dumps(claimed), self.packet_id)
+            )
+            
+            update_user_coins(user_id, grabbed_amount)
+            conn.commit()
+            
+            # 回傳隱私訊息
+            await interaction.response.send_message(f"🎉 恭喜你搶到了 **{grabbed_amount}** 枚金幣！🪙", ephemeral=True)
+            
+            # 💡 【核心修改】檢查廣播開關
+            if redpacket_broadcast_enabled:
+                creator = await interaction.client.fetch_user(packet["creator_id"])
+                await interaction.channel.send(
+                    f"🧧 【紅包喜報】{interaction.user.mention} 成功奪下 {creator.mention} 的紅包，斬獲 **{grabbed_amount}** 金幣！"
+                    f" (剩餘 {new_remaining_pieces} 份)"
+                )
+            
+            # 鎖定按鈕
+            if new_remaining_pieces == 0:
+                button.disabled = True
+                button.label = "🧧 已被搶光"
+                await interaction.message.edit(view=self)
+                
+        except Exception as e:
+            print(f"❌ [紅包系統出錯] 原因: {e}")
+            await interaction.response.send_message("❌ 搶紅包時系統發生未知錯誤！", ephemeral=True)
+        finally:
+            cursor.close()
+            conn.close()
 
 def update_user_status(user_id: int, **kwargs):
-    """動態更新使用者的打工或任務狀態"""
+    """動態更新使用者的打工或任務狀態到 MySQL"""
     try:
+        if not kwargs:
+            return
         conn = get_db_connection()
+        if conn is None:
+            return
         cursor = conn.cursor()
-        # 組裝 SQL 語法，例如 task_id = %s, task_progress = %s
+        
+        # 動態拼裝 SQL 語句
         set_clause = ", ".join([f"{key} = %s" for key in kwargs.keys()])
         sql = f"UPDATE user_coins SET {set_clause} WHERE user_id = %s"
         params = list(kwargs.values()) + [user_id]
         
         cursor.execute(sql, params)
-        conn.commit()
+        conn.commit() # 💡 攸關生死：官方套件必須 commit 才會真正存進去！
         cursor.close()
         conn.close()
     except Exception as e:
@@ -407,6 +526,8 @@ async def handle_chat_earn_coins(message: discord.Message):
         else:
             # 沒完成但有進度（例如純聊天 1/10 變成 2/10），也要即時寫入資料庫保存，防止重啟倒退
             update_user_status(user_id, task_progress=current_progress)
+
+
 
 def ensure_snapshots_table():
     try:
@@ -742,6 +863,30 @@ class AntiNukeBot(commands.Bot):
 bot = AntiNukeBot()
 
 @bot.event
+
+@bot.event
+async def on_ready():
+    # 1. 自動掃描資料庫中「尚未搶完」的紅包，並自動掛載按鈕
+    conn = get_db_connection()
+    if conn:
+        cursor = conn.cursor(dictionary=True)
+        # 撈出所有還有剩餘份數的紅包
+        cursor.execute("SELECT id FROM red_packets WHERE remaining_pieces > 0")
+        active_packets = cursor.fetchall()
+        
+        for p in active_packets:
+            # 對每一個活動中的紅包，都註冊一個 View
+            bot.add_view(RedPacketView(packet_id=p['id']))
+            print(f"✅ 已恢復紅包 ID: {p['id']} 的監聽")
+        
+        cursor.close()
+        conn.close()
+
+    # 2. 同步指令
+    await bot.tree.sync()
+    print(f"✨ 防炸兔兔 v1.1.0 恢復運作！")
+    
+    print(f"🤖 {bot.user.name} 已上線，紅包系統已恢復監聽！")
 async def on_message(message: discord.Message):
     # 1. 基本過濾：排除機器人自己、其他 Bot、或者私訊
     if message.author.bot or message.guild is None:
@@ -1400,7 +1545,7 @@ async def scan_and_ban_blacklist(guild):
                                 "因為其已被加入本伺服器的防踢白名單。\n\n"
                                 "若您要讓黑名單用戶在此伺服器中不被自動停權，可使用 `/add-server-anti-kick` 將目標 ID 加入防踢白名單。"
                             )
-                            embed.set_footer(text="防炸兔兔 v1.0.8")
+                            embed.set_footer(text="防炸兔兔 v1.1.0")
                             await send_log(guild, embed=embed)
                         except Exception:
                             pass
@@ -1422,7 +1567,7 @@ async def scan_and_ban_blacklist(guild):
                                 "如果您確定此帳號在本伺服器是安全的、並希望未來不要再被自動停權，\n"
                                 "伺服器擁有者可以使用 `/add-server-anti-kick` 指令將其加入本伺服器的防踢白名單。"
                             )
-                            embed.set_footer(text="防炸兔兔 v1.0.8")
+                            embed.set_footer(text="防炸兔兔 v1.1.0")
                             await send_log(guild, embed=embed)
                         except Exception:
                             pass
@@ -1452,7 +1597,7 @@ async def check_permission_errors(guild):
 - 檢視審核日誌 (View Audit Log)
 
 權限不足會導致無法正常防護伺服器，Bot 將自動離開此伺服器。"""
-            embed.set_footer(text="防炸兔兔 v1.0.8")
+            embed.set_footer(text="防炸兔兔 v1.1.0")
             try:
                 await send_log(guild, embed=embed)
                 print(f"[PERMISSION] 已向伺服器所有者/記錄頻道發送通知")
@@ -1731,12 +1876,12 @@ async def scan_blacklist_cmd(interaction: discord.Interaction):
         embed.add_field(name="掃描人數", value=str(scan_count), inline=True)
         embed.add_field(name="停權人數", value=str(banned_count), inline=True)
         embed.add_field(name="伺服器", value=interaction.guild.name, inline=False)
-        embed.set_footer(text="防炸兔兔 v1.0.8")
+        embed.set_footer(text="防炸兔兔 v1.1.0")
         await interaction.followup.send(embed=embed)
     except Exception as e:
         embed = discord.Embed(title="掃描失敗", color=discord.Color.red())
         embed.description = f"掃描伺服器時出錯: {str(e)}"
-        embed.set_footer(text="防炸兔兔 v1.0.8")
+        embed.set_footer(text="防炸兔兔 v1.1.0")
         await interaction.followup.send(embed=embed)
 
 # 臨時白名單 - 管理員可增刪
@@ -1851,7 +1996,7 @@ async def server_whitelist_cmd(interaction: discord.Interaction):
             lines.append(f"  {i+1}. `{bid}`")
     embed = discord.Embed(title="本伺服器白名單狀態", color=discord.Color.blue())
     embed.description = "\n".join(lines[:30])
-    embed.set_footer(text="防炸兔兔 v1.0.8")
+    embed.set_footer(text="防炸兔兔 v1.1.0")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="set-log-channel", description="設定本伺服器的記錄頻道 (管理員)")
@@ -2174,7 +2319,7 @@ async def blacklist_cmd(interaction: discord.Interaction):
     embed.description = "\n".join(lines[:10])
     if len(lines) > 10:
         embed.add_field(name="提示", value=f"還有 {len(lines) - 10} 個機器人未顯示", inline=False)
-    embed.set_footer(text="防炸兔兔 v1.0.8")
+    embed.set_footer(text="防炸兔兔 v1.1.0")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="whitelist-list", description="查看全域白名單 (開發者)")
@@ -2192,7 +2337,7 @@ async def whitelist_list(interaction: discord.Interaction):
     embed.description = "\n".join(lines[:10])
     if len(lines) > 10:
         embed.add_field(name="提示", value=f"還有 {len(lines) - 10} 個機器人未顯示", inline=False)
-    embed.set_footer(text="防炸兔兔 v1.0.8")
+    embed.set_footer(text="防炸兔兔 v1.1.0")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="scan-all-guilds", description="在所有伺服器掃描並停權黑名單成員 (開發者)")
@@ -2209,12 +2354,12 @@ async def scan_all_guilds_cmd(interaction: discord.Interaction):
             "若您希望在特定伺服器中允許某些黑名單帳號，"
             "可於該伺服器使用 `/add-server-anti-kick` 將其加入防踢白名單，以避免未來的自動停權。"
         )
-        embed.set_footer(text="防炸兔兔 v1.0.8")
+        embed.set_footer(text="防炸兔兔 v1.1.0")
         await interaction.followup.send(embed=embed)
     except Exception as e:
         embed = discord.Embed(title="全域掃描失敗", color=discord.Color.red())
         embed.description = f"掃描時出錯: {str(e)}"
-        embed.set_footer(text="防炸兔兔 v1.0.8")
+        embed.set_footer(text="防炸兔兔 v1.1.0")
         await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="task", description="🛡️ 兔兔每日日常任務！達成小互動賺取高額金幣")
@@ -2281,6 +2426,35 @@ async def task(interaction: discord.Interaction):
         embed.set_footer(text="提示：完成後滿足進度，獎勵會自動發放或再次輸入 /task 查看喔！")
         
     await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="rp_config", description="⚙️ [管理員專用] 設定紅包功能的啟用狀態與是否開起洗頻廣播")
+@app_commands.describe(
+    status="True 為開啟紅包，False 為暫停紅包", 
+    broadcast="True 為開啟聊天室中獎喜報，False 為關閉廣播防止洗版"
+)
+async def config_redpacket(interaction: discord.Interaction, status: bool = True, broadcast: bool = True):
+    # 檢查是否為管理員
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 你沒有權限操控兔兔銀行！", ephemeral=True)
+        return
+        
+    global redpacket_enabled, redpacket_broadcast_enabled
+    redpacket_enabled = status
+    redpacket_broadcast_enabled = broadcast
+    
+    state_msg = "🟢 **已開啟**" if redpacket_enabled else "🔴 **已暫停**"
+    bc_msg = "🔊 **會發送中獎喜報**" if redpacket_broadcast_enabled else "🔕 **低調默默領取（防洗版）**"
+    
+    embed = discord.Embed(
+        title="⚙️ 紅包系統設定更新",
+        description=f"管理員 {interaction.user.mention} 已調整系統設定：",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="📌 紅包功能狀態", value=state_msg, inline=True)
+    embed.add_field(name="💬 聊天室廣播", value=bc_msg, inline=True)
+    
+    await interaction.response.send_message(embed=embed)
+    print(f"[系統設定] 紅包開關: {redpacket_enabled} | 喜報廣播: {redpacket_broadcast_enabled}")
 
 @bot.tree.command(name="announce-all", description="向所有伺服器發送全服公告 (開發者)")
 @app_commands.describe(message="公告內容")
@@ -2353,7 +2527,7 @@ async def check_black(interaction: discord.Interaction, entity_id: str):
     if not info_black and not info_white:
         embed = discord.Embed(title="查詢結果", color=discord.Color.green())
         embed.description = f"ID `{target_id}` 不在全域黑名單，也不在全域白名單。"
-        embed.set_footer(text="防炸兔兔 v1.0.8")
+        embed.set_footer(text="防炸兔兔 v1.1.0")
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
 
@@ -2380,7 +2554,7 @@ async def check_black(interaction: discord.Interaction, entity_id: str):
             lines.append(f"- 加入時間 (timestamp)：`{tsw}`")
 
     embed.description = "\n".join(lines)
-    embed.set_footer(text="防炸兔兔 v1.0.8")
+    embed.set_footer(text="防炸兔兔 v1.1.0")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="snapshot_list", description="查看此伺服器目前擁有的所有快照版本")
@@ -2444,6 +2618,184 @@ async def snapshot_list(interaction: discord.Interaction):
         )
 
     await interaction.followup.send(embed=embed)
+
+@bot.tree.command(name="redpacket", description="🧧 灑金幣啦！發送一個拼手速隨機紅包到群組裡")
+@app_commands.describe(total_coins="準備塞進紅包的總金幣量", pieces="總共要分給幾個人搶")
+async def send_red_packet(interaction: discord.Interaction, total_coins: int, pieces: int):
+    user_id = interaction.user.id
+    
+    if total_coins <= 0 or pieces <= 0:
+        await interaction.response.send_message("❌ 金額和份數必須是大於 0 的正整數喔！", ephemeral=True)
+        return
+        
+    if pieces > total_coins:
+        await interaction.response.send_message(f"❌ 金幣太少不夠分！{pieces} 個紅包至少需要 {pieces} 枚金幣。", ephemeral=True)
+        return
+
+    # ─── 💾 核心邏輯：檢查發紅包的人錢夠不夠 ───
+    conn = get_db_connection()
+    if conn is None:
+        await interaction.response.send_message("❌ 資料庫連線失敗！", ephemeral=True)
+        return
+    cursor = conn.cursor(dictionary=True)
+    
+    try:
+        # 1. 撈出發紅包人的金幣餘額
+        cursor.execute("SELECT coins FROM user_coins WHERE user_id = %s", (user_id,))
+        user_data = cursor.fetchone()
+        
+        # 防呆：如果沒資料或錢不夠
+        current_balance = user_data["coins"] if user_data else 0
+        if current_balance < total_coins:
+            await interaction.response.send_message(
+                f"❌ 你的錢包空空如也！目前餘額：**{current_balance}** 金幣，不夠發 **{total_coins}** 金幣的紅包。", 
+                ephemeral=True
+            )
+            return
+
+        # 2. 扣除發紅包人的錢（呼叫你的 update_user_coins，傳入負數代表扣錢）
+        update_user_coins(user_id, -total_coins)
+        
+        # 3. 將紅包資訊寫入新建立的紅包表
+        cursor.execute(
+            "INSERT INTO red_packets (creator_id, total_amount, total_pieces, remaining_amount, remaining_pieces, claimed_list) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (user_id, total_coins, pieces, total_coins, pieces, json.dumps({}))
+        )
+        conn.commit()
+        
+        # 4. 拿到剛剛自動生成的紅包 ID
+        packet_id = cursor.lastrowid
+        
+        # 5. 渲染精美的 Discord 紅包面板
+        embed = discord.Embed(
+            title="🧧 兔兔天降紅包雨！",
+            description=f"{interaction.user.mention} 揮金如土，扔出了一個大紅包！\n群友們快來拼手速，看看誰是今天的運氣王！",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="💰 紅包總額", value=f"**{total_coins}** 金幣", inline=True)
+        embed.add_field(name="👥 紅包份數", value=f"**{pieces}** 份", inline=True)
+        embed.set_footer(text="提示：每個人只能搶一次，金額完全隨機喔！")
+        
+        # 發送帶有按鈕的紅包訊息
+        await interaction.response.send_message(embed=embed, view=RedPacketView(packet_id))
+        print(f"[紅包系統] {interaction.user.name} 成功發放了一個 ID 為 {packet_id} 的紅包。")
+        
+    except Exception as e:
+        print(f"❌ [發紅包崩潰] 原因: {e}")
+        await interaction.response.send_message("❌ 發行紅包失敗，系統已自動退回金幣。", ephemeral=True)
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@bot.tree.command(name="rp_info", description="🧧 查看指定紅包的領取名單與詳情")
+@app_commands.describe(packet_id="紅包的 ID (可以在資料庫或紅包紀錄中找到)")
+async def check_red_packet(interaction: discord.Interaction, packet_id: int):
+    conn = get_db_connection()
+    if not conn:
+        await interaction.response.send_message("❌ 資料庫連線失敗。", ephemeral=True)
+        return
+    
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM red_packets WHERE id = %s", (packet_id,))
+    packet = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if not packet:
+        await interaction.response.send_message(f"❌ 找不到 ID 為 {packet_id} 的紅包紀錄。", ephemeral=True)
+        return
+        
+    # 解析 JSON 領取清單
+    claimed_data = json.loads(packet["claimed_list"]) if packet["claimed_list"] else {}
+    
+    # 建立精美的資訊面板
+    embed = discord.Embed(title=f"🧧 紅包 #{packet_id} 領取詳情", color=discord.Color.gold())
+    embed.add_field(name="💰 總金額", value=f"{packet['total_amount']} 金幣", inline=True)
+    embed.add_field(name="👥 總份數", value=f"{packet['total_pieces']} 份", inline=True)
+    embed.add_field(name="剩餘", value=f"{packet['remaining_pieces']} 份", inline=True)
+    
+    # 列出搶到的人
+    if not claimed_data:
+        embed.description = "目前還沒人搶過這個紅包喔！"
+    else:
+        desc = ""
+        for uid, amount in claimed_data.items():
+            # 嘗試抓取用戶名稱 (如果機器人剛好抓不到該用戶，就顯示 ID)
+            user = interaction.guild.get_member(int(uid))
+            name = user.display_name if user else f"用戶 {uid}"
+            desc += f"👤 {name}: **{amount}** 金幣\n"
+        embed.description = desc
+        
+    await interaction.response.send_message(embed=embed)
+    
+@bot.tree.command(name="give", description="🪙 慷慨解囊！直接轉帳金幣給伺服器裡的某個群友")
+@app_commands.describe(target="想要給錢的對象 (@某人 或 選擇成員)", amount="要轉帳的金幣數量")
+async def give_coins(interaction: discord.Interaction, target: discord.Member, amount: int):
+    giver_id = interaction.user.id
+    receiver_id = target.id
+    
+    # 1. 基礎防呆
+    if target.bot:
+        await interaction.response.send_message("❌ 兔兔和機器人夥伴們是不收賄賂的！請轉帳給一般人類。", ephemeral=True)
+        return
+        
+    if giver_id == receiver_id:
+        await interaction.response.send_message("❌ 左手交給右手有意思嗎？不能轉帳給自己啦！", ephemeral=True)
+        return
+        
+    if amount <= 0:
+        await interaction.response.send_message("❌ 轉帳金額必須是大於 0 的正整數喔！", ephemeral=True)
+        return
+
+    # 2. 透過 MySQL 檢查你的錢夠不夠，並執行轉帳
+    conn = get_db_connection()
+    if conn is None:
+        await interaction.response.send_message("❌ 資料庫連線失敗，請稍後再試！", ephemeral=True)
+        return
+    cursor = conn.cursor(dictionary=True)
+    
+    try:
+        # 撈出轉帳人（你）的餘額
+        cursor.execute("SELECT coins FROM user_coins WHERE user_id = %s", (giver_id,))
+        giver_data = cursor.fetchone()
+        
+        current_balance = giver_data["coins"] if giver_data else 0
+        if current_balance < amount:
+            await interaction.response.send_message(
+                f"❌ 賸餘財產不足！你目前只有 **{current_balance}** 金幣，不夠支付 **{amount}** 金幣。", 
+                ephemeral=True
+            )
+            return
+
+        # 3. 雙向扣款與撥款
+        # 扣除你的錢 (傳入負數)
+        update_user_coins(giver_id, -amount)
+        # 加上對方的錢 (傳入正數)
+        update_user_coins(receiver_id, amount)
+        
+        # 4. 發送成功的精美 Embed 喜報
+        embed = discord.Embed(
+            title="💸 兔兔銀行轉帳成功！",
+            description=f"{interaction.user.mention} 剛剛完成了一筆慷慨的轉帳！",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="👤 匯款人", value=interaction.user.mention, inline=True)
+        embed.add_field(name="🎯 收款人", value=target.mention, inline=True)
+        embed.add_field(name="💰 轉帳金額", value=f"**{amount}** 枚金幣 🪙", inline=False)
+        embed.set_footer(text="誠信交易，概不退還。")
+        
+        # 公開在頻道廣播
+        await interaction.response.send_message(embed=embed)
+        print(f"[轉帳系統] {interaction.user.name} 成功轉帳 {amount} 金幣給 {target.name}。")
+        
+    except Exception as e:
+        print(f"❌ [轉帳崩潰] 原因: {e}")
+        await interaction.response.send_message("❌ 轉帳交易失敗，系統已鎖定資產。", ephemeral=True)
+    finally:
+        cursor.close()
+        conn.close()
 
 @bot.tree.command(name="snapshot_create", description="備份目前伺服器的頻道結構 (最多保留最新 5 個版本)")
 async def snapshot_create(interaction: discord.Interaction):
