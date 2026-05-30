@@ -16,7 +16,7 @@ import mysql.connector
 from mysql.connector import Error
 from collections import defaultdict
 import datetime
-
+adm = app_commands.Group(name="adm", description="🔒 僅限管理員使用的管理員後台")
 # 🧧 紅包功能全域開關
 redpacket_enabled = True 
 
