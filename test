@@ -17,6 +17,8 @@ from mysql.connector import Error
 from collections import defaultdict
 import datetime
 adm = app_commands.Group(name="adm", description="🔒 僅限管理員使用的管理員後台")
+server_group = app_commands.Group(name="server", description="伺服器結構與維護", parent=adm)
+system_group = app_commands.Group(name="system", description="系統運作狀態管理", parent=adm)
 # 🧧 紅包功能全域開關
 redpacket_enabled = True 
 
@@ -34,10 +36,10 @@ work_cooldowns = {}
 
 # 💼 純按鈕式打工職缺（全自動跑進度條）
 JOB_POOL = {
-    1: {"name": "外送員 🛵", "desc": "正在頂著大太陽瘋狂飆車送外賣...", "base_reward": 30},
-    2: {"name": "超商店員 🏪", "desc": "遇到結帳大塞車，正在瘋狂幫客人刷條碼...", "base_reward": 35},
-    3: {"name": "寫扣工程師 💻", "desc": "瘋狂通宵趕專案，正在一邊修 BUG 一邊罵髒話...", "base_reward": 50},
-    4: {"name": "點心師傅 🥐", "desc": "正在廚房裡使勁揉麵糰、烤香噴噴的可頌...", "base_reward": 40},
+    1: {"name": "外送員 🛵", "desc": "正在頂著大太陽瘋狂飆車送外賣...", "base_reward": 40},
+    2: {"name": "超商店員 🏪", "desc": "遇到結帳大塞車，正在瘋狂幫客人刷條碼...", "base_reward": 45},
+    3: {"name": "寫扣工程師 💻", "desc": "瘋狂通宵趕專案，正在一邊修 BUG 一邊罵髒話...", "base_reward": 100},
+    4: {"name": "點心師傅 🥐", "desc": "正在廚房裡使勁揉麵糰、烤香噴噴的可頌...", "base_reward": 70},
     5: {"name": "薪水小偷 🦥", "desc": "正在躲在廁所裡瘋狂滑手機摸魚...", "base_reward": 20}
 }
 
@@ -226,6 +228,31 @@ MYSQL_USER = os.getenv("MYSQL_USER", "")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
 MYSQL_DB = os.getenv("MYSQL_DB", "")
 
+# 1. 寫入或更新設定的函式
+def update_bot_setting(key, value):
+    global db, cursor
+    try:
+        # 將 boolean 轉換為 1 或 0 (MySQL 儲存 BOOLEAN 的方式)
+        val_int = 1 if value else 0
+        sql = """
+        INSERT INTO bot_settings (key_name, value_bool) 
+        VALUES (%s, %s) 
+        ON DUPLICATE KEY UPDATE value_bool = %s
+        """
+        cursor.execute(sql, (key, val_int, val_int))
+        db.commit()
+    except Exception as e:
+        print(f"❌ 更新設定失敗: {e}")
+
+# 2. 從資料庫讀取設定的函式
+def get_bot_setting(key):
+    try:
+        cursor.execute("SELECT value_bool FROM bot_settings WHERE key_name = %s", (key,))
+        result = cursor.fetchone()
+        # 如果有值則回傳，若查無資料則預設為 True (1)
+        return bool(result[0]) if result else True
+    except:
+        return True
 
 def get_db_connection():
     return mysql.connector.connect(
@@ -866,6 +893,7 @@ bot = AntiNukeBot()
 
 @bot.event
 async def on_ready():
+    bot.tree.add_command(adm)
     # 1. 自動掃描資料庫中「尚未搶完」的紅包，並自動掛載按鈕
     conn = get_db_connection()
     if conn:
@@ -1808,7 +1836,7 @@ async def dispatch_global_announcement(guild: discord.Guild, message: str, sende
 
 # Slash commands
 
-@bot.tree.command(name="status", description="檢查兔兔狀態")
+@system_group.command(name="status", description="檢查兔兔狀態")
 async def status(interaction: discord.Interaction):
     # 先延遲回應，因為中間有查資料庫的動作，避免 Discord 逾時
     await interaction.response.defer(ephemeral=True)
@@ -1862,7 +1890,7 @@ async def status(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 @app_commands.checks.has_permissions(administrator=True)
-@bot.tree.command(name="scan-blacklist", description="掃描並停權伺服器中的黑名單成員 (管理員)")
+@server_group.command(name="scan-blacklist", description="掃描並停權伺服器中的黑名單成員 (管理員)")
 async def scan_blacklist_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
@@ -1886,7 +1914,7 @@ async def scan_blacklist_cmd(interaction: discord.Interaction):
 
 # 臨時白名單 - 管理員可增刪
 @app_commands.checks.has_permissions(administrator=True)
-@bot.tree.command(name="add-server-temp", description="將成員或機器人加入本伺服器臨時白名單 (管理員)")
+@server_group.command(name="add-server-temp", description="將成員或機器人加入本伺服器臨時白名單 (管理員)")
 @app_commands.describe(entity_id="成員或機器人 ID")
 async def add_server_temp(interaction: discord.Interaction, entity_id: str):
     await interaction.response.defer(ephemeral=True)
@@ -1899,7 +1927,7 @@ async def add_server_temp(interaction: discord.Interaction, entity_id: str):
     await interaction.followup.send(f"已將 `{entity_id}` 加入本伺服器臨時白名單 (1 小時)", ephemeral=True)
 
 @app_commands.checks.has_permissions(administrator=True)
-@bot.tree.command(name="remove-server-temp", description="從本伺服器臨時白名單移除成員或機器人 (管理員)")
+@server_group.command(name="remove-server-temp", description="從本伺服器臨時白名單移除成員或機器人 (管理員)")
 @app_commands.describe(entity_id="成員或機器人 ID")
 async def remove_server_temp(interaction: discord.Interaction, entity_id: str):
     await interaction.response.defer(ephemeral=True)
@@ -1912,7 +1940,7 @@ async def remove_server_temp(interaction: discord.Interaction, entity_id: str):
     await interaction.followup.send(f"已從本伺服器臨時白名單移除 `{entity_id}`", ephemeral=True)
 
 # 防踢白名單 - 只有伺服器擁有者可以設定
-@bot.tree.command(name="add-server-anti-kick", description="將成員或機器人加入本伺服器防踢白名單 (僅擁有者)")
+@server_group.command(name="add-server-anti-kick", description="將成員或機器人加入本伺服器防踢白名單 (僅擁有者)")
 @app_commands.describe(entity_id="成員或機器人 ID")
 async def add_server_anti_kick(interaction: discord.Interaction, entity_id: str):
     if interaction.user.id != interaction.guild.owner_id:
@@ -1926,7 +1954,7 @@ async def add_server_anti_kick(interaction: discord.Interaction, entity_id: str)
     add_anti_kick_whitelist(interaction.guild.id, eid)
     await interaction.response.send_message(f"已將 `{entity_id}` 加入本伺服器防踢白名單", ephemeral=True)
 
-@bot.tree.command(name="remove-server-anti-kick", description="從本伺服器防踢白名單移除成員或機器人 (僅擁有者)")
+@server_group.command(name="remove-server-anti-kick", description="從本伺服器防踢白名單移除成員或機器人 (僅擁有者)")
 @app_commands.describe(entity_id="成員或機器人 ID")
 async def remove_server_anti_kick(interaction: discord.Interaction, entity_id: str):
     if interaction.user.id != interaction.guild.owner_id:
@@ -1941,7 +1969,7 @@ async def remove_server_anti_kick(interaction: discord.Interaction, entity_id: s
     await interaction.response.send_message(f"已從本伺服器防踢白名單移除 `{entity_id}`", ephemeral=True)
 
 # 永久白名單 - 只有伺服器擁有者可以設定
-@bot.tree.command(name="add-server-perm", description="將成員或機器人加入本伺服器永久白名單 (僅擁有者)")
+@server_group.command(name="add-server-perm", description="將成員或機器人加入本伺服器永久白名單 (僅擁有者)")
 @app_commands.describe(entity_id="成員或機器人 ID")
 async def add_server_perm(interaction: discord.Interaction, entity_id: str):
     if interaction.user.id != interaction.guild.owner_id:
@@ -1955,7 +1983,7 @@ async def add_server_perm(interaction: discord.Interaction, entity_id: str):
     add_permanent_whitelist(interaction.guild.id, eid)
     await interaction.response.send_message(f"已將 `{entity_id}` 加入本伺服器永久白名單", ephemeral=True)
 
-@bot.tree.command(name="remove-server-perm", description="從本伺服器永久白名單移除成員或機器人 (僅擁有者)")
+@server_group.command(name="remove-server-perm", description="從本伺服器永久白名單移除成員或機器人 (僅擁有者)")
 @app_commands.describe(entity_id="成員或機器人 ID")
 async def remove_server_perm(interaction: discord.Interaction, entity_id: str):
     if interaction.user.id != interaction.guild.owner_id:
@@ -1969,7 +1997,7 @@ async def remove_server_perm(interaction: discord.Interaction, entity_id: str):
     remove_permanent_whitelist(interaction.guild.id, eid)
     await interaction.response.send_message(f"已從本伺服器永久白名單移除 `{entity_id}`", ephemeral=True)
 
-@bot.tree.command(name="server-whitelist", description="查看本伺服器白名單 (管理員)")
+@server_group.command(name="server-whitelist", description="查看本伺服器白名單 (管理員)")
 async def server_whitelist_cmd(interaction: discord.Interaction):
     gid = interaction.guild.id
     anti = server_whitelists[gid]["anti_kick"]
@@ -1999,7 +2027,7 @@ async def server_whitelist_cmd(interaction: discord.Interaction):
     embed.set_footer(text="防炸兔兔 v1.1.0")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="set-log-channel", description="設定本伺服器的記錄頻道 (管理員)")
+@system_group.command(name="set-log-channel", description="設定本伺服器的記錄頻道 (管理員)")
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.describe(channel="記錄頻道（提及頻道或 ID）")
 async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel = None):
@@ -2011,7 +2039,7 @@ async def set_log_channel(interaction: discord.Interaction, channel: discord.Tex
     await interaction.response.send_message(f"已將 {channel.mention} 設為記錄頻道。", ephemeral=True)
 
 @app_commands.checks.has_permissions(administrator=True)
-@bot.tree.command(name="toggle-anti-hijack", description="開啟或關閉反被盜帳功能 (管理員)")
+@system_group.command(name="toggle-anti-hijack", description="開啟或關閉反被盜帳功能 (管理員)")
 @app_commands.describe(mode="輸入 on 或 off")
 async def toggle_anti_hijack(interaction: discord.Interaction, mode: str):
     gid = interaction.guild.id
@@ -2023,7 +2051,7 @@ async def toggle_anti_hijack(interaction: discord.Interaction, mode: str):
     anti_hijack_settings[gid]["enabled"] = enabled
     await interaction.response.send_message(f"反被盜帳功能已{'啟用' if enabled else '關閉'}。", ephemeral=True)
 
-@bot.tree.command(name="add-black", description="將使用者或機器人加入全域黑名單 (開發者)")
+@system_group.command(name="add-black", description="將使用者或機器人加入全域黑名單 (開發者)")
 @app_commands.describe(target_id="欲黑名單的 真人使用者 或 機器人 ID", reason="原因")
 async def add_black(interaction: discord.Interaction, target_id: str, reason: str = ""):
     global bot_blacklist
@@ -2255,7 +2283,7 @@ async def work(interaction: discord.Interaction):
     embed.set_footer(text=f"員工：{interaction.user.name} | 錢包餘額：{get_user_coins(user_id)} 幣")
     
     await interaction.edit_original_response(embed=embed)
-@bot.tree.command(name="remove-black", description="從全域黑名單移除機器人 (開發者)")
+@system_group.command(name="remove-black", description="從全域黑名單移除機器人 (開發者)")
 @app_commands.describe(bot_id="機器人 ID")
 async def remove_black(interaction: discord.Interaction, bot_id: str):
     global bot_blacklist
@@ -2271,7 +2299,7 @@ async def remove_black(interaction: discord.Interaction, bot_id: str):
     embed.description = f"機器人 ID: `{bot_id}` 已從全域黑名單移除"
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="add-white", description="將機器人加入全域白名單 (開發者)")
+@system_group.command(name="add-white", description="將機器人加入全域白名單 (開發者)")
 @app_commands.describe(bot_id="機器人 ID", reason="原因")
 async def add_white(interaction: discord.Interaction, bot_id: str, reason: str = ""):
     global bot_whitelist
@@ -2288,7 +2316,7 @@ async def add_white(interaction: discord.Interaction, bot_id: str, reason: str =
     embed.add_field(name="原因", value=reason if reason else "無", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="remove-white", description="從全域白名單移除機器人 (開發者)")
+@system_group.command(name="remove-white", description="從全域白名單移除機器人 (開發者)")
 @app_commands.describe(bot_id="機器人 ID")
 async def remove_white(interaction: discord.Interaction, bot_id: str):
     global bot_whitelist
@@ -2304,7 +2332,7 @@ async def remove_white(interaction: discord.Interaction, bot_id: str):
     embed.description = f"機器人 ID: `{bot_id}` 已從全域白名單移除"
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="blacklist", description="查看全域黑名單 (開發者)")
+@system_group.command(name="blacklist", description="查看全域黑名單 (開發者)")
 async def blacklist_cmd(interaction: discord.Interaction):
     if interaction.user.id != DEVELOPER_ID:
         await interaction.response.send_message("只有開發者可以使用此指令", ephemeral=True)
@@ -2322,7 +2350,7 @@ async def blacklist_cmd(interaction: discord.Interaction):
     embed.set_footer(text="防炸兔兔 v1.1.0")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="whitelist-list", description="查看全域白名單 (開發者)")
+@system_group.command(name="whitelist-list", description="查看全域白名單 (開發者)")
 async def whitelist_list(interaction: discord.Interaction):
     if interaction.user.id != DEVELOPER_ID:
         await interaction.response.send_message("只有開發者可以使用此指令", ephemeral=True)
@@ -2340,7 +2368,7 @@ async def whitelist_list(interaction: discord.Interaction):
     embed.set_footer(text="防炸兔兔 v1.1.0")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="scan-all-guilds", description="在所有伺服器掃描並停權黑名單成員 (開發者)")
+@system_group.command(name="scan-all-guilds", description="在所有伺服器掃描並停權黑名單成員 (開發者)")
 async def scan_all_guilds_cmd(interaction: discord.Interaction):
     if interaction.user.id != DEVELOPER_ID:
         await interaction.response.send_message("只有開發者可以使用此指令", ephemeral=True)
@@ -2427,7 +2455,7 @@ async def task(interaction: discord.Interaction):
         
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="rp_config", description="⚙️ [管理員專用] 設定紅包功能的啟用狀態與是否開起洗頻廣播")
+@server_group.command(name="rp_config", description="⚙️ [管理員專用] 設定紅包功能的啟用狀態與是否開起洗頻廣播")
 @app_commands.describe(
     status="True 為開啟紅包，False 為暫停紅包", 
     broadcast="True 為開啟聊天室中獎喜報，False 為關閉廣播防止洗版"
@@ -2456,7 +2484,7 @@ async def config_redpacket(interaction: discord.Interaction, status: bool = True
     await interaction.response.send_message(embed=embed)
     print(f"[系統設定] 紅包開關: {redpacket_enabled} | 喜報廣播: {redpacket_broadcast_enabled}")
 
-@bot.tree.command(name="announce-all", description="向所有伺服器發送全服公告 (開發者)")
+@system_group.command(name="announce-all", description="向所有伺服器發送全服公告 (開發者)")
 @app_commands.describe(message="公告內容")
 async def announce_all(interaction: discord.Interaction, message: str):
     if interaction.user.id != DEVELOPER_ID:
@@ -2495,7 +2523,7 @@ async def announce_all(interaction: discord.Interaction, message: str):
 # ==========================================
 # 4. 切換防文字洗頻開關（/toggle_spam）
 # ==========================================
-@bot.tree.command(name="toggle_spam", description="開啟或關閉聊天室防文字洗頻功能")
+@server_group.command(name="toggle_spam", description="開啟或關閉聊天室防文字洗頻功能")
 @app_commands.describe(action="選擇要開啟或關閉")
 @app_commands.choices(action=[
     app_commands.Choice(name="開啟 (ON)", value="on"),
@@ -2516,7 +2544,7 @@ async def toggle_spam(interaction: discord.Interaction, action: app_commands.Cho
         spam_protection_enabled = False
         await interaction.response.send_message("🛑 已**關閉**聊天室防文字洗頻功能。", ephemeral=True)
 
-@bot.tree.command(name="check-black", description="查詢某個 ID 是否在全域黑名單或白名單 (管理員)")
+@system_group.command(name="check-black", description="查詢某個 ID 是否在全域黑名單或白名單 (管理員)")
 @app_commands.describe(entity_id="使用者或機器人 ID（純數字）")
 async def check_black(interaction: discord.Interaction, entity_id: str):
     await interaction.response.defer(ephemeral=True)
@@ -2557,7 +2585,7 @@ async def check_black(interaction: discord.Interaction, entity_id: str):
     embed.set_footer(text="防炸兔兔 v1.1.0")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="snapshot_list", description="查看此伺服器目前擁有的所有快照版本")
+@server_group.command(name="snapshot_list", description="查看此伺服器目前擁有的所有快照版本")
 async def snapshot_list(interaction: discord.Interaction):
     # ─── 修正：檢查是否擁有管理員權限 ───
     if not interaction.user.guild_permissions.administrator:
@@ -2797,7 +2825,7 @@ async def give_coins(interaction: discord.Interaction, target: discord.Member, a
         cursor.close()
         conn.close()
 
-@bot.tree.command(name="snapshot_create", description="備份目前伺服器的頻道結構 (最多保留最新 5 個版本)")
+@server_group.command(name="snapshot_create", description="備份目前伺服器的頻道結構 (最多保留最新 5 個版本)")
 async def snapshot_create(interaction: discord.Interaction):
     # ─── 修正：檢查是否擁有管理員權限 ───
     if not interaction.user.guild_permissions.administrator:
@@ -2878,7 +2906,7 @@ async def snapshot_create(interaction: discord.Interaction):
 # 2. 斜線指令本體（/snapshot_restore）
 # ==========================================
 # 注意：這裡加上了 app_commands.describe，讓使用者輸入時有提示
-@bot.tree.command(name="snapshot_restore", description="從資料庫讀取快照並還原伺服器頻道結構 (自動避免重複)")
+@server_group.command(name="snapshot_restore", description="從資料庫讀取快照並還原伺服器頻道結構 (自動避免重複)")
 @app_commands.describe(snapshot_id="欲還原的快照編號 ID (留空則預設還原最新的一筆)")
 async def snapshot_restore(interaction: discord.Interaction, snapshot_id: int = None):
     # ─── 修正：檢查是否擁有管理員權限 ───
